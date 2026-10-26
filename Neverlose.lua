@@ -339,40 +339,60 @@ function Library:SetIconPack(pack) Icons.Default = pack end
 function Library:LoadIcons(url) Icons.Loaded = false; Icons.Load(url) end
 
 
-local function MakeDraggable(frame, handle)
+local function MakeDraggable(frame, handle, canStart)
 	handle = handle or frame
-	local dragging = false
-	local dragInput, mousePos, framePos
-
-	local function update(input)
-		local delta = input.Position - mousePos
-		frame.Position = UDim2.new(framePos.X.Scale, framePos.X.Offset + delta.X, framePos.Y.Scale, framePos.Y.Offset + delta.Y)
-	end
+	local dragging, dragInput, startPos, framePos = false, nil, nil, nil
 
 	handle.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
-			dragging = true
-			mousePos = input.Position
-			framePos = frame.Position
-			input.Changed:Connect(function()
-				if input.UserInputState == Enum.UserInputState.End then
-					dragging = false
-				end
-			end)
-		end
-	end)
-
-	handle.InputChanged:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseMovement then
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			if canStart and not canStart(input) then return end
+			dragging  = true
 			dragInput = input
+			startPos  = input.Position
+			framePos  = frame.Position
 		end
 	end)
 
 	UserInputService.InputChanged:Connect(function(input)
-		if input == dragInput and dragging then
-			update(input)
+		if not dragging then return end
+		local isMove = input.UserInputType == Enum.UserInputType.MouseMovement
+		local isTouchMove = input.UserInputType == Enum.UserInputType.Touch and input == dragInput
+		if isMove or isTouchMove then
+			local d = input.Position - startPos
+			frame.Position = UDim2.new(framePos.X.Scale, framePos.X.Offset + d.X, framePos.Y.Scale, framePos.Y.Offset + d.Y)
 		end
 	end)
+
+	UserInputService.InputEnded:Connect(function(input)
+		if input == dragInput then dragging = false end
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+	end)
+end
+
+-- Only start dragging the window from "empty" areas.
+-- Anything inside a ScrollingFrame (sliders, sections, lists) or any button/textbox is ignored,
+-- so touching a slider no longer moves the whole window.
+local function CanDragWindowFrom(input)
+	local objs = game:GetService("GuiService"):GetGuiObjectsAtPosition(input.Position.X, input.Position.Y)
+	local top = objs[1]
+	if not top then return true end
+	if top:IsA("GuiButton") or top:IsA("TextBox") then return false end
+	local p = top
+	while p do
+		if p:IsA("ScrollingFrame") then return false end
+		p = p.Parent
+	end
+	return true
+end
+
+-- Freeze every parent ScrollingFrame while a slider is being dragged (stops list scrolling on mobile)
+local function LockScroll(obj, locked)
+	local p = obj.Parent
+	while p do
+		if p:IsA("ScrollingFrame") then p.ScrollingEnabled = not locked end
+		p = p.Parent
+	end
 end
 
 local _openPopups = {}
@@ -400,7 +420,7 @@ UserInputService.InputBegan:Connect(function(input, gp)
 	if gp then return end
 	if input.UserInputType ~= Enum.UserInputType.MouseButton1
 		and input.UserInputType ~= Enum.UserInputType.Touch then return end
-	local mp = UserInputService:GetMouseLocation()
+	local mp = Vector2.new(input.Position.X, input.Position.Y)
 	local toClose = {}
 	for _, p in ipairs(_openPopups) do
 		if p.frame and p.frame.Visible then
@@ -425,7 +445,7 @@ local function SmoothClose(frame, dur, cb)
 	task.delay((dur or 0.18) + 0.01, function() frame.Visible = false; if cb then cb() end end)
 end
 
-function Library:AddWindow(hubTitle, hubImage, gameTitle)
+function Library:AddWindow(hubTitle, hubImage, gameTitle, toggleImage)
 	hubTitle = hubTitle or "Neverlose"
 	hubImage = hubImage or ""
 	gameTitle = gameTitle or "Counter Strike 2"
@@ -455,7 +475,6 @@ function Library:AddWindow(hubTitle, hubImage, gameTitle)
 	local MainFrame = New("Frame", {
 		Name = "MainFrame",
       Active = true,
-      Draggable = true,
       AnchorPoint = Vector2.new(0.5,0.4),
 		Size = UDim2.new(1, 0, 1, 0),
 		BackgroundColor3 = Color3.fromRGB(3,3,14),
@@ -2853,74 +2872,98 @@ Line9.Parent = MainFrame
 	Line4.Parent = MainFrame
 
 	
-	MakeDraggable(ImageLabel, MainFrame)
+	MakeDraggable(MainFrame, MainFrame, CanDragWindowFrom)
 
 	
-	local ToggleBtn = Instance.new("TextButton")
+	-- Floating square toggle button (mobile). PC keeps using the [H] key
+	local ToggleBtn = Instance.new("ImageButton")
 	ToggleBtn.Name = "ToggleBtn"
-	ToggleBtn.Position = UDim2.new(0, 10, 0, 10)
-   ToggleBtn.BackgroundTransparency = 1
-   ToggleBtn.Active = true
-   ToggleBtn.Draggable = true
-	ToggleBtn.Size = UDim2.new(0, 100, 0, 28)
-	ToggleBtn.BackgroundColor3 = Color3.fromRGB(16,19,28)
-	ToggleBtn.BorderSizePixel = 1
-	ToggleBtn.Text = "Close  [H]"
-	ToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-	ToggleBtn.TextScaled = true
-	ToggleBtn.Font = Enum.Font.SourceSansSemibold
+	ToggleBtn.AutoButtonColor = false
+	ToggleBtn.Position = UDim2.new(0, 12, 0, 70)
+	ToggleBtn.Size = UDim2.new(0, 46, 0, 46)
+	ToggleBtn.BackgroundColor3 = Color3.fromRGB(16, 19, 28)
+	ToggleBtn.BackgroundTransparency = 0.1
+	ToggleBtn.BorderSizePixel = 0
+	ToggleBtn.Image = toggleImage or Library.ToggleImage or hubImage or ""
+	ToggleBtn.ScaleType = Enum.ScaleType.Crop
 	ToggleBtn.ZIndex = 999
+	ToggleBtn.Active = true
+	ToggleBtn.Visible = UserInputService.TouchEnabled or Library.ShowToggleOnPC == true
 	ToggleBtn.Parent = NeverloseCS2
-	do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = ToggleBtn end
-	
-local DropShadow = Instance.new("ImageLabel")
-DropShadow.Name = "DropShadow"
-	DropShadow.Parent = ToggleBtn
-	DropShadow.AnchorPoint = Vector2.new(0.5, 0.5)
-	DropShadow.BackgroundTransparency = 1.000
-	DropShadow.BorderSizePixel = 0
-	DropShadow.Position = UDim2.new(0.5, 0, 0.5, 0)
-	DropShadow.Size = UDim2.new(1, 47, 1, 47)
-	DropShadow.ZIndex = -1
-	DropShadow.Image = "rbxassetid://6014261993"
-	DropShadow.ImageColor3 = Color3.fromRGB(12,14,22)
-	DropShadow.ImageTransparency = 0
-	DropShadow.ScaleType = Enum.ScaleType.Slice
-	DropShadow.SliceCenter = Rect.new(49, 49, 450, 450)
-	DropShadow.Rotation = 0.001
-
-
+	New("UICorner", { CornerRadius = UDim.new(0, 12) }, ToggleBtn)
+	local ToggleStroke = New("UIStroke", {
+		Color = Color3.fromRGB(26, 123, 255),
+		Thickness = 2,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	}, ToggleBtn)
 
 	local guiOpen = true
 	local function toggleGui()
-    guiOpen = not guiOpen
-    ToggleBtn.Text = guiOpen and "Close [H]" or "Open  [H]"
-    Tween(ToggleBtn, {
-        BackgroundColor3 = guiOpen and Color3.fromRGB(16,19,28) or Color3.fromRGB(33,37,53)
-    }, 0.1)
-    if guiOpen then
-        MainFrame.BackgroundTransparency = 1
-        MainFrame.Visible = true
-        AcrylicBlur.Instances.Part.Transparency = 1
-        AcrylicBlur.Instances.DepthOfField.Enabled = true
-        AcrylicBlur.Signal = game:GetService("RunService").RenderStepped:Connect(AcrylicBlur.Update)
-        Tween(MainFrame, { BackgroundTransparency = 0.2 }, 0.12)
-        Tween(AcrylicBlur.Instances.Part, { Transparency = 0.8 }, 0.12)
-    else
-        if AcrylicBlur.Signal then
-            AcrylicBlur.Signal:Disconnect()
-            AcrylicBlur.Signal = nil
-        end
-        Tween(MainFrame, { BackgroundTransparency = 1 }, 0.12)
-        Tween(AcrylicBlur.Instances.Part, { Transparency = 1 }, 0.12)
-        task.delay(0.13, function()
-            MainFrame.Visible = false
-            AcrylicBlur.Instances.DepthOfField.Enabled = false
-        end)
-    end
-end
+		guiOpen = not guiOpen
+		Tween(ToggleBtn, {
+			BackgroundTransparency = guiOpen and 0.1 or 0.45,
+			ImageTransparency = guiOpen and 0 or 0.45,
+		}, 0.15)
+		Tween(ToggleStroke, { Transparency = guiOpen and 0 or 0.6 }, 0.15)
+		if guiOpen then
+			MainFrame.BackgroundTransparency = 1
+			MainFrame.Visible = true
+			AcrylicBlur.Instances.Part.Transparency = 1
+			AcrylicBlur.Instances.DepthOfField.Enabled = true
+			AcrylicBlur.Signal = game:GetService("RunService").RenderStepped:Connect(AcrylicBlur.Update)
+			Tween(MainFrame, { BackgroundTransparency = 0.2 }, 0.12)
+			Tween(AcrylicBlur.Instances.Part, { Transparency = 0.8 }, 0.12)
+		else
+			if AcrylicBlur.Signal then
+				AcrylicBlur.Signal:Disconnect()
+				AcrylicBlur.Signal = nil
+			end
+			Tween(MainFrame, { BackgroundTransparency = 1 }, 0.12)
+			Tween(AcrylicBlur.Instances.Part, { Transparency = 1 }, 0.12)
+			task.delay(0.13, function()
+				if guiOpen then return end
+				MainFrame.Visible = false
+				AcrylicBlur.Instances.DepthOfField.Enabled = false
+			end)
+		end
+	end
 
-	ToggleBtn.MouseButton1Click:Connect(toggleGui)
+	-- drag the button around; a tap (little movement) toggles the window
+	do
+		local tracking, moved, dragInput, startIn, startPos = false, false, nil, nil, nil
+		ToggleBtn.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				tracking, moved = true, false
+				dragInput = input
+				startIn = input.Position
+				startPos = ToggleBtn.Position
+			end
+		end)
+		UserInputService.InputChanged:Connect(function(input)
+			if not tracking then return end
+			if input.UserInputType == Enum.UserInputType.MouseMovement
+				or (input.UserInputType == Enum.UserInputType.Touch and input == dragInput) then
+				local d = input.Position - startIn
+				if d.Magnitude > 8 then moved = true end
+				if moved then
+					local screen = NeverloseCS2.AbsoluteSize
+					local x = math.clamp(startPos.X.Offset + d.X, 0, math.max(0, screen.X - ToggleBtn.AbsoluteSize.X))
+					local y = math.clamp(startPos.Y.Offset + d.Y, 0, math.max(0, screen.Y - ToggleBtn.AbsoluteSize.Y))
+					ToggleBtn.Position = UDim2.new(0, x, 0, y)
+				end
+			end
+		end)
+		UserInputService.InputEnded:Connect(function(input)
+			if not tracking then return end
+			if input == dragInput or input.UserInputType == Enum.UserInputType.MouseButton1 then
+				tracking = false
+				if not moved then toggleGui() end
+			end
+		end)
+	end
+
+	-- (old) ToggleBtn.MouseButton1Click:Connect(toggleGui)
 
 	UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		if gameProcessed then return end
@@ -3559,7 +3602,7 @@ UIAspectRatioConstraint.Parent = Slider
 
 					Line.InputBegan:Connect(function(input)
 						if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-							dragging = true; update(input)
+							dragging = true; LockScroll(Line, true); local _c; _c = input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then LockScroll(Line, false); _c:Disconnect() end end); update(input)
 						end
 					end)
 					UserInputService.InputEnded:Connect(function(input)
@@ -4667,7 +4710,7 @@ UIAspectRatioConstraint.Parent = Colorpicker
 
 				Line.InputBegan:Connect(function(input)
 					if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-						dragging = true
+						dragging = true; LockScroll(Line, true); local _c; _c = input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then LockScroll(Line, false); _c:Disconnect() end end)
 						update(input)
 					end
 				end)
@@ -4780,8 +4823,8 @@ UIAspectRatioConstraint.Parent = Colorpicker
 
 				local DownBar = New("Frame", {
 					Name = "DownBar",
-					Position = UDim2.new(0.56, 0, 0, 0),
-					Size = UDim2.new(0.5, 0, 0, 0),
+					Position = UDim2.new(0.498, 0, 0.88, 0),
+					Size = UDim2.new(0.46, 0, 0, 0),
 					BackgroundColor3 = Color3.fromRGB(16,19,28),
 					Visible = false,
 					ZIndex = 300,
@@ -4809,7 +4852,7 @@ UIAspectRatioConstraint.Parent = Colorpicker
 				local function closeDropdown()
 					dropOpen = false
 					--Tween(Arrow, { Rotation = 0 }, 0.2)
-					Tween(DownBar, { Size = UDim2.new(0.5, 0, 0, 0) }, 0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+					Tween(DownBar, { Size = UDim2.new(0.46, 0, 0, 0) }, 0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
 					task.delay(0.21, function() DownBar.Visible = false end)
 					UnregisterPopup(DownBar)
 					if _openDropdown == closeDropdown then _openDropdown = nil end
@@ -4818,7 +4861,7 @@ UIAspectRatioConstraint.Parent = Colorpicker
 				for _, opt in ipairs(options) do
 					local Buttons = New("TextButton", {
 						Name = "Buttons",
-						Size = UDim2.new(1, 0, 0, 16),
+						Size = UDim2.new(1, 0, 0, 22),
 						BackgroundColor3 = Color3.fromRGB(32, 35, 50),
 						BackgroundTransparency = 1,
 						Text = opt,
@@ -4854,9 +4897,9 @@ UIAspectRatioConstraint.Parent = Colorpicker
 						dropOpen = true
 						_openDropdown = closeDropdown
 						DownBar.Visible = true
-						DownBar.Size = UDim2.new(0.5, 0, 0, 0)
+						DownBar.Size = UDim2.new(0.46, 0, 0, 0)
 						local h = math.min(#options * 24, 96)
-						Tween(DownBar, { Size = UDim2.new(0.5, 0, 0, h) }, 0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+						Tween(DownBar, { Size = UDim2.new(0.46, 0, 0, h) }, 0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
 						--Tween(Arrow, { Rotation = 90 }, 0.25)
 						RegisterPopup(DownBar, closeDropdown)
 					end
@@ -4967,8 +5010,8 @@ UIAspectRatioConstraint.Parent = Colorpicker
 				-- Dropdown list frame
 				local DownBar = New("Frame", {
 					Name = "DownBar",
-					Position = UDim2.new(0.56, 0, 0, 0),
-					Size = UDim2.new(0.5, 0, 0, 0),
+					Position = UDim2.new(0.498, 0, 0.88, 0),
+					Size = UDim2.new(0.46, 0, 0, 0),
 					BackgroundColor3 = Color3.fromRGB(16,19,28),
 					ClipsDescendants = true,
 					Visible = false,
@@ -4999,7 +5042,7 @@ UIAspectRatioConstraint.Parent = Colorpicker
 				local function closeDropdown()
 					dropOpen = false
 					--Tween(Arrow, { Rotation = 0 }, 0.2)
-					Tween(DownBar, { Size = UDim2.new(0.5, 0, 0, 0) }, 0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+					Tween(DownBar, { Size = UDim2.new(0.46, 0, 0, 0) }, 0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
 					task.delay(0.21, function() DownBar.Visible = false end)
 					UnregisterPopup(DownBar)
 					if _openDropdown == closeDropdown then _openDropdown = nil end
@@ -5008,7 +5051,7 @@ UIAspectRatioConstraint.Parent = Colorpicker
 				for _, opt in ipairs(options) do
 					local Btn = New("TextButton", {
 						Name = "Buttons",
-						Size = UDim2.new(1, 0, 0, 16),
+						Size = UDim2.new(1, 0, 0, 22),
 						BackgroundColor3 = Color3.fromRGB(32, 35, 50),
 						BackgroundTransparency = 1,
 						Text = opt,
@@ -5048,9 +5091,9 @@ UIAspectRatioConstraint.Parent = Colorpicker
 						dropOpen = true
 						_openDropdown = closeDropdown
 						DownBar.Visible = true
-						DownBar.Size = UDim2.new(0.5, 0, 0, 0)
+						DownBar.Size = UDim2.new(0.46, 0, 0, 0)
 						local h = math.min(#options * 24, 96)
-						Tween(DownBar, { Size = UDim2.new(0.5, 0, 0, h) }, 0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+						Tween(DownBar, { Size = UDim2.new(0.46, 0, 0, h) }, 0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
 						--Tween(Arrow, { Rotation = 90 }, 0.25)
 						RegisterPopup(DownBar, closeDropdown)
 					end
@@ -6243,7 +6286,7 @@ UIAspectRatioConstraint.Parent = Slider
 
 					Line.InputBegan:Connect(function(input)
 						if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-							dragging = true; update(input)
+							dragging = true; LockScroll(Line, true); local _c; _c = input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then LockScroll(Line, false); _c:Disconnect() end end); update(input)
 						end
 					end)
 					UserInputService.InputEnded:Connect(function(input)
