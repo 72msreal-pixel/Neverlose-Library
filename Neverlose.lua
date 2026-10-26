@@ -339,51 +339,55 @@ function Library:SetIconPack(pack) Icons.Default = pack end
 function Library:LoadIcons(url) Icons.Loaded = false; Icons.Load(url) end
 
 
-local function MakeDraggable(frame, handle, canStart)
-	handle = handle or frame
-	local dragging, dragInput, startPos, framePos = false, nil, nil, nil
+local GuiService = game:GetService("GuiService")
+-- inputs that a widget (slider...) has taken for itself; the window will not drag with them
+local _claimed = setmetatable({}, { __mode = "k" })
 
-	handle.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1
-			or input.UserInputType == Enum.UserInputType.Touch then
-			if canStart and not canStart(input) then return end
-			dragging  = true
-			dragInput = input
-			startPos  = input.Position
-			framePos  = frame.Position
+local function MakeDraggable(frame, region)
+	region = region or frame
+	local dragging, startInput, startPos, framePos = false, nil, nil, nil
+
+	local function canStart(input)
+		local objs = GuiService:GetGuiObjectsAtPosition(input.Position.X, input.Position.Y)
+		local overRegion = false
+		for _, o in ipairs(objs) do
+			if o == region then overRegion = true; break end
+			-- something sitting above the window (button, textbox, scrollable list) owns this touch
+			if o:IsA("GuiButton") or o:IsA("TextBox") then return false end
+			if o:IsA("ScrollingFrame") then
+				local c, w = o.AbsoluteCanvasSize, o.AbsoluteWindowSize
+				if c.Y > w.Y + 1 or c.X > w.X + 1 then return false end
+			end
+		end
+		return overRegion
+	end
+
+	UserInputService.InputBegan:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1
+			and input.UserInputType ~= Enum.UserInputType.Touch then return end
+		if not region.Visible then return end
+		if canStart(input) then
+			dragging, startInput = true, input
+			startPos, framePos = input.Position, frame.Position
 		end
 	end)
 
 	UserInputService.InputChanged:Connect(function(input)
 		if not dragging then return end
-		local isMove = input.UserInputType == Enum.UserInputType.MouseMovement
-		local isTouchMove = input.UserInputType == Enum.UserInputType.Touch and input == dragInput
-		if isMove or isTouchMove then
+		if _claimed[startInput] then dragging = false; return end
+		local isMouse = input.UserInputType == Enum.UserInputType.MouseMovement
+		local isTouch = input.UserInputType == Enum.UserInputType.Touch and input == startInput
+		if isMouse or isTouch then
 			local d = input.Position - startPos
 			frame.Position = UDim2.new(framePos.X.Scale, framePos.X.Offset + d.X, framePos.Y.Scale, framePos.Y.Offset + d.Y)
 		end
 	end)
 
 	UserInputService.InputEnded:Connect(function(input)
-		if input == dragInput then dragging = false end
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+		if input == startInput or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = false
+		end
 	end)
-end
-
--- Only start dragging the window from "empty" areas.
--- Anything inside a ScrollingFrame (sliders, sections, lists) or any button/textbox is ignored,
--- so touching a slider no longer moves the whole window.
-local function CanDragWindowFrom(input)
-	local objs = game:GetService("GuiService"):GetGuiObjectsAtPosition(input.Position.X, input.Position.Y)
-	local top = objs[1]
-	if not top then return true end
-	if top:IsA("GuiButton") or top:IsA("TextBox") then return false end
-	local p = top
-	while p do
-		if p:IsA("ScrollingFrame") then return false end
-		p = p.Parent
-	end
-	return true
 end
 
 -- Freeze every parent ScrollingFrame while a slider is being dragged (stops list scrolling on mobile)
@@ -445,7 +449,140 @@ local function SmoothClose(frame, dur, cb)
 	task.delay((dur or 0.18) + 0.01, function() frame.Visible = false; if cb then cb() end end)
 end
 
-function Library:AddWindow(hubTitle, hubImage, gameTitle, toggleImage)
+-- ───────── Popup dropdown (parented to the ScreenGui, so it never gets clipped / covered) ─────────
+local _activeDrop = nil
+local function CreateDropPopup(gui, anchor, getItems, getSelected, onPick, accent)
+	accent = accent or Color3.fromRGB(26, 123, 255)
+	local self = { IsOpen = false }
+	local MAX_VISIBLE = 6
+
+	local popup = New("ScrollingFrame", {
+		Name = "DropPopup",
+		Visible = false,
+		ZIndex = 2000,
+		Size = UDim2.fromOffset(0, 0),
+		BackgroundColor3 = Color3.fromRGB(16, 19, 28),
+		BackgroundTransparency = 0.03,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 2,
+		ScrollBarImageColor3 = accent,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ClipsDescendants = true,
+		Parent = gui,
+	})
+	New("UICorner", { CornerRadius = UDim.new(0, 6) }, popup)
+	New("UIStroke", { Color = Color3.fromRGB(60, 66, 90), Transparency = 0.4, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, popup)
+	New("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, popup)
+
+	local follow
+	local function visibleChain()
+		local o = anchor
+		while o and o ~= gui do
+			if o:IsA("GuiObject") and not o.Visible then return false end
+			o = o.Parent
+		end
+		return o == gui
+	end
+	local function itemH() return math.max(20, math.floor(anchor.AbsoluteSize.Y + 0.5)) end
+	local function place()
+		local ap, as = anchor.AbsolutePosition, anchor.AbsoluteSize
+		popup.Position = UDim2.fromOffset(ap.X, ap.Y + as.Y + 3)
+	end
+
+	function self:Build()
+		for _, c in ipairs(popup:GetChildren()) do
+			if c:IsA("TextButton") then c:Destroy() end
+		end
+		local items, sel, h = getItems(), getSelected(), itemH()
+		for i, it in ipairs(items) do
+			local picked = (it == sel)
+			local b = New("TextButton", {
+				Size = UDim2.new(1, 0, 0, h),
+				LayoutOrder = i,
+				ZIndex = 2001,
+				AutoButtonColor = false,
+				BackgroundColor3 = accent,
+				BackgroundTransparency = picked and 0.82 or 1,
+				Text = tostring(it),
+				Font = Enum.Font.SourceSansSemibold,
+				TextSize = math.clamp(math.floor(h * 0.58), 11, 22),
+				TextColor3 = picked and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(170, 174, 190),
+				TextXAlignment = Enum.TextXAlignment.Left,
+				Parent = popup,
+			})
+			New("UIPadding", { PaddingLeft = UDim.new(0, 10) }, b)
+			b.MouseEnter:Connect(function()
+				if it ~= getSelected() then Tween(b, { BackgroundTransparency = 0.9, TextColor3 = Color3.fromRGB(255, 255, 255) }, 0.1) end
+			end)
+			b.MouseLeave:Connect(function()
+				if it ~= getSelected() then Tween(b, { BackgroundTransparency = 1, TextColor3 = Color3.fromRGB(170, 174, 190) }, 0.1) end
+			end)
+			b.MouseButton1Click:Connect(function()
+				onPick(it)
+				self:Close()
+			end)
+		end
+	end
+
+	function self:Open()
+		if _activeDrop and _activeDrop ~= self then _activeDrop:Close() end
+		_activeDrop = self
+		self.IsOpen = true
+		self:Build()
+		local items, h = getItems(), itemH()
+		local w = math.max(anchor.AbsoluteSize.X, 80)
+		place()
+		popup.Size = UDim2.fromOffset(w, 0)
+		popup.Visible = true
+		Tween(popup, { Size = UDim2.fromOffset(w, math.min(#items, MAX_VISIBLE) * h) }, 0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		follow = RunService.RenderStepped:Connect(function()
+			if not visibleChain() then self:Close(true) return end
+			place()
+		end)
+	end
+
+	function self:Close(instant)
+		if not self.IsOpen then return end
+		self.IsOpen = false
+		if _activeDrop == self then _activeDrop = nil end
+		if follow then follow:Disconnect(); follow = nil end
+		if instant then
+			popup.Visible = false
+			return
+		end
+		Tween(popup, { Size = UDim2.fromOffset(popup.AbsoluteSize.X, 0) }, 0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		task.delay(0.15, function()
+			if not self.IsOpen then popup.Visible = false end
+		end)
+	end
+
+	function self:Toggle()
+		if self.IsOpen then self:Close() else self:Open() end
+	end
+
+	-- tap / click anywhere else closes it
+	UserInputService.InputBegan:Connect(function(input)
+		if not self.IsOpen then return end
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+		local p = Vector2.new(input.Position.X, input.Position.Y)
+		local function inside(o)
+			local ap, as = o.AbsolutePosition, o.AbsoluteSize
+			return p.X >= ap.X and p.X <= ap.X + as.X and p.Y >= ap.Y and p.Y <= ap.Y + as.Y
+		end
+		if not inside(popup) and not inside(anchor) then self:Close() end
+	end)
+
+	return self
+end
+
+function Library:CreateWindow(cfg)
+	cfg = cfg or {}
+	return self:AddWindow(cfg.Title, cfg.Icon, cfg.Author, cfg.ToggleImage, cfg)
+end
+
+function Library:AddWindow(hubTitle, hubImage, gameTitle, toggleImage, cfg)
+	cfg = cfg or {}
 	hubTitle = hubTitle or "Neverlose"
 	hubImage = hubImage or ""
 	gameTitle = gameTitle or "Counter Strike 2"
@@ -453,7 +590,14 @@ function Library:AddWindow(hubTitle, hubImage, gameTitle, toggleImage)
 	daysLeft = daysLeft or "Lifetime"
 	local userImage = "rbxthumb://type=AvatarHeadShot&id=" .. LocalPlayer.UserId .. "&w=150&h=150"
 
-	local mainColor = Color3.fromRGB(26, 123, 255)
+	local ThemePresets = {
+		Blue   = Color3.fromRGB(26, 123, 255), Red    = Color3.fromRGB(255, 60, 80),
+		Green  = Color3.fromRGB(60, 220, 120), Purple = Color3.fromRGB(150, 90, 255),
+		Pink   = Color3.fromRGB(255, 105, 180), Orange = Color3.fromRGB(255, 150, 50),
+		Cyan   = Color3.fromRGB(0, 200, 255),
+	}
+	local mainColor = cfg.Accent or ThemePresets[cfg.Theme or "Blue"] or ThemePresets.Blue
+	local baseAlpha = (cfg.Transparent == false) and 0 or 0.2
 	local tabs = {}
 	local activeTabIndex = nil
 	local tabOrder = 0
@@ -479,10 +623,18 @@ function Library:AddWindow(hubTitle, hubImage, gameTitle, toggleImage)
 		Size = UDim2.new(1, 0, 1, 0),
 		BackgroundColor3 = Color3.fromRGB(3,3,14),
       Position = UDim2.new(0.5, 0, 0.4, 0),
-		BackgroundTransparency = 0.2,
+		BackgroundTransparency = baseAlpha,
 		BorderSizePixel = 1,
 	}, NeverloseCS2)
 	New("UICorner", {}, MainFrame)
+	if cfg.Background and cfg.Background ~= "" then
+		local bg = New("ImageLabel", {
+			Name = "Background", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+			Image = cfg.Background, ScaleType = Enum.ScaleType.Crop,
+			ImageTransparency = cfg.BackgroundImageTransparency or 0.8,
+		}, MainFrame)
+		New("UICorner", {}, bg)
+	end
 
 	local AcrylicLib = LoadAcrylic()
 	local AcrylicBlur = AcrylicLib.new(MainFrame)
@@ -1347,7 +1499,7 @@ UIAspectRatioConstraint.Parent = ImageLabel
 			SelBtn.BackgroundTransparency = 1
 			SelBtn.BorderSizePixel = 0
 			SelBtn.Text = ""
-			SelBtn.TextColor3 = Color3.fromRGB(26,123,255)
+			SelBtn.TextColor3 = mainColor
 			SelBtn.TextScaled = true
 			SelBtn.ZIndex = 1004
 			SelBtn.Parent = BtnRow
@@ -1423,7 +1575,7 @@ UIAspectRatioConstraint.Parent = ImageLabel
 			SelBtn.BackgroundTransparency = 1
 			SelBtn.BorderSizePixel = 0
 			SelBtn.Text = ""
-			SelBtn.TextColor3 = Color3.fromRGB(26,123,255)
+			SelBtn.TextColor3 = mainColor
 			SelBtn.TextScaled = true
 			SelBtn.ZIndex = 1004
 			SelBtn.Parent = BtnRow
@@ -1627,7 +1779,7 @@ UIAspectRatioConstraint.Parent = ImageLabel
 			SelBtn.BackgroundTransparency = 1
 			SelBtn.BorderSizePixel = 0
 			SelBtn.Text = ""
-			SelBtn.TextColor3 = Color3.fromRGB(26,123,255)
+			SelBtn.TextColor3 = mainColor
 			SelBtn.TextScaled = true
 			SelBtn.ZIndex = 1004
 			SelBtn.Parent = BtnRow
@@ -1889,6 +2041,7 @@ UIAspectRatioConstraint.Parent = ImageLabel
 
 local asss = Instance.new("UIAspectRatioConstraint")
 asss.Parent = SearchBtn
+if cfg.HideSearchBar then SearchBtn.Visible = false end
 
 	local _configs = {}
 
@@ -2872,7 +3025,7 @@ Line9.Parent = MainFrame
 	Line4.Parent = MainFrame
 
 	
-	MakeDraggable(MainFrame, MainFrame, CanDragWindowFrom)
+	MakeDraggable(MainFrame, MainFrame)
 
 	
 	-- Floating square toggle button (mobile). PC keeps using the [H] key
@@ -2884,7 +3037,7 @@ Line9.Parent = MainFrame
 	ToggleBtn.BackgroundColor3 = Color3.fromRGB(16, 19, 28)
 	ToggleBtn.BackgroundTransparency = 0.1
 	ToggleBtn.BorderSizePixel = 0
-	ToggleBtn.Image = toggleImage or Library.ToggleImage or hubImage or ""
+	ToggleBtn.Image = toggleImage or cfg.ToggleImage or Library.ToggleImage or hubImage or ""
 	ToggleBtn.ScaleType = Enum.ScaleType.Crop
 	ToggleBtn.ZIndex = 999
 	ToggleBtn.Active = true
@@ -2892,7 +3045,7 @@ Line9.Parent = MainFrame
 	ToggleBtn.Parent = NeverloseCS2
 	New("UICorner", { CornerRadius = UDim.new(0, 12) }, ToggleBtn)
 	local ToggleStroke = New("UIStroke", {
-		Color = Color3.fromRGB(26, 123, 255),
+		Color = mainColor,
 		Thickness = 2,
 		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
 	}, ToggleBtn)
@@ -2900,18 +3053,13 @@ Line9.Parent = MainFrame
 	local guiOpen = true
 	local function toggleGui()
 		guiOpen = not guiOpen
-		Tween(ToggleBtn, {
-			BackgroundTransparency = guiOpen and 0.1 or 0.45,
-			ImageTransparency = guiOpen and 0 or 0.45,
-		}, 0.15)
-		Tween(ToggleStroke, { Transparency = guiOpen and 0 or 0.6 }, 0.15)
 		if guiOpen then
 			MainFrame.BackgroundTransparency = 1
 			MainFrame.Visible = true
 			AcrylicBlur.Instances.Part.Transparency = 1
 			AcrylicBlur.Instances.DepthOfField.Enabled = true
 			AcrylicBlur.Signal = game:GetService("RunService").RenderStepped:Connect(AcrylicBlur.Update)
-			Tween(MainFrame, { BackgroundTransparency = 0.2 }, 0.12)
+			Tween(MainFrame, { BackgroundTransparency = baseAlpha }, 0.12)
 			Tween(AcrylicBlur.Instances.Part, { Transparency = 0.8 }, 0.12)
 		else
 			if AcrylicBlur.Signal then
@@ -2967,13 +3115,13 @@ Line9.Parent = MainFrame
 
 	UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		if gameProcessed then return end
-		if input.KeyCode == Enum.KeyCode.H then
+		if input.KeyCode == (cfg.ToggleKey or Enum.KeyCode.H) then
 			toggleGui()
 		end
 	end)
 
 	MainFrame.BackgroundTransparency = 1
-	Tween(MainFrame, { BackgroundTransparency = 0.2 }, 0.5)
+	Tween(MainFrame, { BackgroundTransparency = baseAlpha }, 0.5)
 
 
 
@@ -3602,7 +3750,7 @@ UIAspectRatioConstraint.Parent = Slider
 
 					Line.InputBegan:Connect(function(input)
 						if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-							dragging = true; LockScroll(Line, true); local _c; _c = input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then LockScroll(Line, false); _c:Disconnect() end end); update(input)
+							dragging = true; _claimed[input] = true; LockScroll(Line, true); local _c; _c = input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then LockScroll(Line, false); _c:Disconnect() end end); update(input)
 						end
 					end)
 					UserInputService.InputEnded:Connect(function(input)
@@ -3794,7 +3942,7 @@ UIAspectRatioConstraint.Parent = Slider
 							BackgroundTransparency = 1,
 							BorderSizePixel = 0,
 							Text = "",
-							TextColor3 = Color3.fromRGB(26, 123, 255),
+							TextColor3 = mainColor,
 							TextScaled = true,
 							ZIndex = 1004,
 						}, BtnRow)
@@ -4710,7 +4858,7 @@ UIAspectRatioConstraint.Parent = Colorpicker
 
 				Line.InputBegan:Connect(function(input)
 					if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-						dragging = true; LockScroll(Line, true); local _c; _c = input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then LockScroll(Line, false); _c:Disconnect() end end)
+						dragging = true; _claimed[input] = true; LockScroll(Line, true); local _c; _c = input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then LockScroll(Line, false); _c:Disconnect() end end)
 						update(input)
 					end
 				end)
@@ -4821,89 +4969,15 @@ UIAspectRatioConstraint.Parent = Colorpicker
 					ZIndex = 7,
 				}, TopBar)
 
-				local DownBar = New("Frame", {
-					Name = "DownBar",
-					Position = UDim2.new(0.498, 0, 0.88, 0),
-					Size = UDim2.new(0.46, 0, 0, 0),
-					BackgroundColor3 = Color3.fromRGB(16,19,28),
-					Visible = false,
-					ZIndex = 300,
-					ClipsDescendants = true,
-				}, Dropdown)
-				New("UICorner", {}, DownBar)
-				New("UIStroke", { Color = Color3.fromRGB(255, 255, 255), Transparency = 0.98, Thickness = 5 }, DownBar)
-
-				local Scrolls = New("ScrollingFrame", {
-					Name = "Scrolls",
-					Size = UDim2.new(1, 0, 1, 0),
-					BackgroundColor3 = Color3.fromRGB(162, 162, 162),
-					BackgroundTransparency = 1,
-					BorderSizePixel = 0,
-					ScrollBarThickness = 1,
-					ZIndex = 301,
-				}, DownBar)
-				New("UIListLayout", {
-					Padding = UDim.new(0, 2),
-					SortOrder = Enum.SortOrder.LayoutOrder,
-				}, Scrolls)
-
-				Scrolls.CanvasSize = UDim2.new(0, 0, 0, #options * 24)
-
-				local function closeDropdown()
-					dropOpen = false
-					--Tween(Arrow, { Rotation = 0 }, 0.2)
-					Tween(DownBar, { Size = UDim2.new(0.46, 0, 0, 0) }, 0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
-					task.delay(0.21, function() DownBar.Visible = false end)
-					UnregisterPopup(DownBar)
-					if _openDropdown == closeDropdown then _openDropdown = nil end
-				end
-
-				for _, opt in ipairs(options) do
-					local Buttons = New("TextButton", {
-						Name = "Buttons",
-						Size = UDim2.new(1, 0, 0, 22),
-						BackgroundColor3 = Color3.fromRGB(32, 35, 50),
-						BackgroundTransparency = 1,
-						Text = opt,
-						TextColor3 = Color3.fromRGB(255, 255, 255),
-						TextScaled = true,
-						Font = Enum.Font.SourceSansSemibold,
-						TextTransparency = 0.20000000298023224,
-						TextXAlignment = Enum.TextXAlignment.Left,
-						ZIndex = 302,
-					}, Scrolls)
-					New("UICorner", { CornerRadius = UDim.new(0, 5) }, Buttons)
-
-					Buttons.MouseEnter:Connect(function()
-						Tween(Buttons, { BackgroundTransparency = 0.6 }, 0.1)
-					end)
-					Buttons.MouseLeave:Connect(function()
-						Tween(Buttons, { BackgroundTransparency = selected == opt and 0.5 or 1 }, 0.1)
-					end)
-					Buttons.MouseButton1Click:Connect(function()
+				local drop = CreateDropPopup(NeverloseCS2, TopBar,
+					function() return options end,
+					function() return selected end,
+					function(opt)
 						selected = opt
 						TopBar.Text = opt
 						if callback then callback(opt) end
-						closeDropdown()
-					end)
-				end
-
-				TopBar.MouseButton1Click:Connect(function()
-					if dropOpen then
-						closeDropdown()
-					else
-						CloseAllPopupsExcept(DownBar)
-						if _openDropdown then _openDropdown() end
-						dropOpen = true
-						_openDropdown = closeDropdown
-						DownBar.Visible = true
-						DownBar.Size = UDim2.new(0.46, 0, 0, 0)
-						local h = math.min(#options * 24, 96)
-						Tween(DownBar, { Size = UDim2.new(0.46, 0, 0, h) }, 0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
-						--Tween(Arrow, { Rotation = 90 }, 0.25)
-						RegisterPopup(DownBar, closeDropdown)
-					end
-				end)
+					end, mainColor)
+				TopBar.MouseButton1Click:Connect(function() drop:Toggle() end)
 
 				local obj = {}
 				function obj:Set(val, silent) selected = val; TopBar.Text = val; if not silent and callback then callback(val) end end
@@ -5008,96 +5082,19 @@ UIAspectRatioConstraint.Parent = Colorpicker
 				}, TopBar)
 
 				-- Dropdown list frame
-				local DownBar = New("Frame", {
-					Name = "DownBar",
-					Position = UDim2.new(0.498, 0, 0.88, 0),
-					Size = UDim2.new(0.46, 0, 0, 0),
-					BackgroundColor3 = Color3.fromRGB(16,19,28),
-					ClipsDescendants = true,
-					Visible = false,
-					ZIndex = 300,
-				}, Dropdown)
-				New("UICorner", {}, DownBar)
-				New("UIStroke", {
-					Color = Color3.fromRGB(255, 255, 255),
-					Transparency = 0.9800000190734863,
-					Thickness = 5,
-				}, DownBar)
-
-				local Scrolls = New("ScrollingFrame", {
-					Name = "Scrolls",
-					Size = UDim2.new(1, 0, 1, 0),
-					BackgroundColor3 = Color3.fromRGB(162, 162, 162),
-					BackgroundTransparency = 1,
-					BorderSizePixel = 0,
-					CanvasSize = UDim2.new(0, 0, 0, #options * 24),
-					ScrollBarThickness = 1,
-					ZIndex = 301,
-				}, DownBar)
-				New("UIListLayout", {
-					Padding = UDim.new(0, 2),
-					SortOrder = Enum.SortOrder.LayoutOrder,
-				}, Scrolls)
-
-				local function closeDropdown()
-					dropOpen = false
-					--Tween(Arrow, { Rotation = 0 }, 0.2)
-					Tween(DownBar, { Size = UDim2.new(0.46, 0, 0, 0) }, 0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
-					task.delay(0.21, function() DownBar.Visible = false end)
-					UnregisterPopup(DownBar)
-					if _openDropdown == closeDropdown then _openDropdown = nil end
-				end
-
-				for _, opt in ipairs(options) do
-					local Btn = New("TextButton", {
-						Name = "Buttons",
-						Size = UDim2.new(1, 0, 0, 22),
-						BackgroundColor3 = Color3.fromRGB(32, 35, 50),
-						BackgroundTransparency = 1,
-						Text = opt,
-						TextColor3 = Color3.fromRGB(255, 255, 255),
-						TextScaled = true,
-						Font = Enum.Font.SourceSansSemibold,
-						TextTransparency = 0.20000000298023224,
-						TextXAlignment = Enum.TextXAlignment.Left,
-						ZIndex = 302,
-					}, Scrolls)
-					New("UICorner", { CornerRadius = UDim.new(0, 5) }, Btn)
-
-					Btn.MouseEnter:Connect(function()
-						Tween(Btn, { BackgroundTransparency = 0.6 }, 0.1)
-					end)
-					Btn.MouseLeave:Connect(function()
-						Tween(Btn, { BackgroundTransparency = selected == opt and 0.5 or 1 }, 0.1)
-					end)
-					Btn.MouseButton1Click:Connect(function()
+				local drop = CreateDropPopup(NeverloseCS2, TopBar,
+					function() return options end,
+					function() return selected end,
+					function(opt)
 						selected = opt
 						TopBar.Text = opt
-						closeDropdown()
 						if colorCallback then
 							if callback then callback(opt) end
 						elseif callback then
 							callback(opt, Color3.fromHSV(color[1], color[2], color[3]))
 						end
-					end)
-				end
-
-				TopBar.MouseButton1Click:Connect(function()
-					if dropOpen then
-						closeDropdown()
-					else
-						CloseAllPopupsExcept(DownBar)
-						if _openDropdown then _openDropdown() end
-						dropOpen = true
-						_openDropdown = closeDropdown
-						DownBar.Visible = true
-						DownBar.Size = UDim2.new(0.46, 0, 0, 0)
-						local h = math.min(#options * 24, 96)
-						Tween(DownBar, { Size = UDim2.new(0.46, 0, 0, h) }, 0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
-						--Tween(Arrow, { Rotation = 90 }, 0.25)
-						RegisterPopup(DownBar, closeDropdown)
-					end
-				end)
+					end, mainColor)
+				TopBar.MouseButton1Click:Connect(function() drop:Toggle() end)
 
 				-- Colorpicker panel
 				local cpFrame = New("Frame", {
@@ -5152,7 +5149,7 @@ UIAspectRatioConstraint.Parent = Colorpicker
 					AnchorPoint = Vector2.new(0.5, 0.5),
 					BackgroundColor3 = Color3.fromRGB(255, 255, 255),
 					BorderSizePixel = 0,
-					Position = UDim2.new(0.5, 0, 0, 0),
+					Position = UDim2.new(0.46, 0, 0, 0),
 					Size = UDim2.new(1.4, 0, 0, 5),
 					ZIndex = 361,
 				}, Darkness)
@@ -6101,7 +6098,7 @@ UIAspectRatioConstraint.Parent = Toggle
 							BackgroundTransparency = 1,
 							BorderSizePixel = 0,
 							Text = "",
-							TextColor3 = Color3.fromRGB(26, 123, 255),
+							TextColor3 = mainColor,
 							TextScaled = true,
 							ZIndex = 1004,
 						}, BtnRow)
@@ -6286,7 +6283,7 @@ UIAspectRatioConstraint.Parent = Slider
 
 					Line.InputBegan:Connect(function(input)
 						if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-							dragging = true; LockScroll(Line, true); local _c; _c = input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then LockScroll(Line, false); _c:Disconnect() end end); update(input)
+							dragging = true; _claimed[input] = true; LockScroll(Line, true); local _c; _c = input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then LockScroll(Line, false); _c:Disconnect() end end); update(input)
 						end
 					end)
 					UserInputService.InputEnded:Connect(function(input)
