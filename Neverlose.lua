@@ -339,7 +339,34 @@ function Library:SetIconPack(pack) Icons.Default = pack end
 function Library:LoadIcons(url) Icons.Loaded = false; Icons.Load(url) end
 
 
-local GuiService = game:GetService("GuiService")
+-- Returns the GuiObjects under a screen point, topmost first.
+-- (GetGuiObjectsAtPosition lives on PlayerGui/CoreGui, not GuiService; manual fallback for gethui containers)
+local function GetObjectsAt(region, pos)
+	local gui = region:FindFirstAncestorOfClass("ScreenGui")
+	local container = gui and gui.Parent
+	if container then
+		local ok, res = pcall(function() return container:GetGuiObjectsAtPosition(pos.X, pos.Y) end)
+		if ok and typeof(res) == "table" then return res end
+	end
+	local out = {}
+	if gui then
+		for _, o in ipairs(gui:GetDescendants()) do
+			if o:IsA("GuiObject") and o.Visible then
+				local ap, as = o.AbsolutePosition, o.AbsoluteSize
+				if pos.X >= ap.X and pos.X <= ap.X + as.X and pos.Y >= ap.Y and pos.Y <= ap.Y + as.Y then
+					local shown, a = true, o.Parent
+					while a and a ~= gui do
+						if a:IsA("GuiObject") and not a.Visible then shown = false break end
+						a = a.Parent
+					end
+					if shown then table.insert(out, o) end
+				end
+			end
+		end
+		table.sort(out, function(a, b) return a.ZIndex > b.ZIndex end)
+	end
+	return out
+end
 -- inputs that a widget (slider...) has taken for itself; the window will not drag with them
 local _claimed = setmetatable({}, { __mode = "k" })
 
@@ -348,7 +375,7 @@ local function MakeDraggable(frame, region)
 	local dragging, startInput, startPos, framePos = false, nil, nil, nil
 
 	local function canStart(input)
-		local objs = GuiService:GetGuiObjectsAtPosition(input.Position.X, input.Position.Y)
+		local objs = GetObjectsAt(region, input.Position)
 		local overRegion = false
 		for _, o in ipairs(objs) do
 			if o == region then overRegion = true; break end
